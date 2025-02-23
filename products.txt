@@ -1,0 +1,6 @@
+alpine
+amazon-linux
+go
+fedora
+postgresql
+rhel

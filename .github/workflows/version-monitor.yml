@@ -1,0 +1,155 @@
+name: Monitor Software Versions
+
+on:
+  push:
+  schedule:
+    - cron: "0 * * * *"  # Runs at the start of every hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure products.txt exists
+        run: |
+          if [ ! -f products.txt ]; then
+            echo "ERROR: products.txt is missing. Please add it to the repository."
+            exit 1
+          fi
+          cat products.txt
+          echo "PRODUCTS=$(cat products.txt | tr '\n' ' ')" >> $GITHUB_ENV
+
+      - name: Fetch and compare version data
+        run: |
+          mkdir -p version_data
+          touch updated_products.txt
+          CHANGES=false
+          FIRST_RUN=false
+
+          for PRODUCT in $(cat products.txt); do
+            echo "Checking version for: $PRODUCT"
+            
+            # Fetch new version data
+            curl -s https://endoflife.date/api/$PRODUCT.json -o version_data/$PRODUCT.json
+            
+            # Ensure previous version file exists
+            if [ ! -f version_data/$PRODUCT-previous.json ]; then
+              echo "No previous data for $PRODUCT, initializing."
+              cp version_data/$PRODUCT.json version_data/$PRODUCT-previous.json
+              echo "$PRODUCT" >> updated_products.txt
+              FIRST_RUN=true
+            else
+              # Compare previous and current versions
+              if ! diff -q version_data/$PRODUCT-previous.json version_data/$PRODUCT.json > /dev/null; then
+                echo "Version data changed for $PRODUCT"
+                echo "$PRODUCT" >> updated_products.txt
+                CHANGES=true
+              fi
+              cp version_data/$PRODUCT.json version_data/$PRODUCT-previous.json
+            fi
+          done
+
+          echo "CHANGES=$CHANGES" >> $GITHUB_ENV
+          echo "FIRST_RUN=$FIRST_RUN" >> $GITHUB_ENV
+
+      - name: Commit and push initialized version data (First Run)
+        if: env.FIRST_RUN == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+          git add version_data/*.json
+          
+          if git diff --cached --quiet; then
+            echo "No changes detected, skipping commit."
+            exit 0
+          fi
+
+          git commit -m "Initialized version tracking for products"
+          git push || echo "Git push failed"
+
+      - name: Commit and push changes per product (Subsequent Runs)
+        if: env.CHANGES == 'true' && env.FIRST_RUN == 'false'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+
+          if [ -s updated_products.txt ]; then
+            while read -r PRODUCT; do
+              if [ -n "$PRODUCT" ]; then
+                echo "Adding updated version data for $PRODUCT"
+                git add version_data/$PRODUCT.json version_data/$PRODUCT-previous.json || echo "Failed to add files for $PRODUCT"
+              fi
+            done < updated_products.txt
+            
+            if git diff --cached --quiet; then
+              echo "No changes detected, skipping commit."
+              exit 0
+            fi
+
+            git commit -m "Updated version data for products"
+            git push || echo "Git push failed"
+          else
+            echo "No changes detected, skipping commit."
+          fi
+
+      - name: Create separate GitHub issues for each updated product
+        if: env.CHANGES == 'true' && env.FIRST_RUN == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const { owner, repo } = context.repo;
+            const labelsToCheck = ["version-tracking", "version-update"];
+
+            async function ensureLabelExists(labelName) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: labelName });
+              } catch (error) {
+                if (error.status === 404) {
+                  console.log(`Creating missing label: ${labelName}`);
+                  await github.rest.issues.createLabel({
+                    owner, repo, name: labelName, color: "ededed",
+                    description: `Automatically created label for ${labelName}`
+                  });
+                }
+              }
+            }
+
+            async function createIssue(product) {
+              const filePath = `version_data/${product}.json`;
+              if (!fs.existsSync(filePath)) return;
+
+              const jsonData = JSON.parse(fs.readFileSync(filePath, "utf8"));
+              const latestVersion = jsonData[jsonData.length - 1]?.latest || "Unknown";
+
+              const issueTitle = `Version Update Detected: ${product} (Version ${latestVersion})`;
+              const issueBody = `A new version update was detected for **${product}** (Version: **${latestVersion}**).\n\nCheck the latest data here:\n\`\`\`json\n${fs.readFileSync(filePath, "utf8")}\n\`\`\``;
+
+              await github.rest.issues.create({
+                owner, repo, title: issueTitle, body: issueBody, labels: labelsToCheck
+              });
+            }
+
+            for (const label of labelsToCheck) {
+              await ensureLabelExists(label);
+            }
+
+            if (fs.existsSync("updated_products.txt")) {
+              const products = fs.readFileSync("updated_products.txt", "utf8").split("\n").filter(Boolean);
+              for (const product of products) {
+                await createIssue(product);
+              }
+            } else {
+              console.log("No updated products found.");
+            }
