@@ -1,6 +1,11 @@
 alpine
+almalinux
 amazon-linux
+amazon-rds-postgresql
 go
 fedora
+podman
 postgresql
+puppet
 rhel
+terraform
